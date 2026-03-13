@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 
 const THRESHOLD_BYTES = 108 * 1000 * 1000; // 108 MB
 const DURATION_PER_FILE_HOURS = 3 / 60; // 3 minutes
@@ -11,6 +11,7 @@ interface SessionRow {
   bad: number;
   total: number;
   eff: string;
+  name: string;
 }
 
 export default function Home() {
@@ -18,10 +19,14 @@ export default function Home() {
   const [cardCounter, setCardCounter] = useState(0);
   const [status, setStatus] = useState({ text: "Ready to Start", type: "idle" });
   const [isScanning, setIsScanning] = useState(false);
+  const [isMonitoring, setIsMonitoring] = useState(false);
   const [currentStats, setCurrentStats] = useState({ good: 0, bad: 0, total: 0 });
-
-  // Averages
   const [averages, setAverages] = useState({ good: 0, bad: 0, total: 0, eff: "0%" });
+
+  // Refs for monitoring state to avoid closure issues in setInterval
+  const lastScanRef = useRef<string>("");
+  const isMonitoringRef = useRef(false);
+  const monitorHandleRef = useRef<any>(null);
 
   useEffect(() => {
     if (sessionData.length === 0) {
@@ -42,8 +47,40 @@ export default function Home() {
     });
   }, [sessionData]);
 
+  // The Monitoring Loop
+  useEffect(() => {
+    let interval: any;
+    if (isMonitoring) {
+      interval = setInterval(async () => {
+        if (monitorHandleRef.current) {
+          await runAutoScan(monitorHandleRef.current);
+        }
+      }, 3000); // Check every 3 seconds
+    }
+    return () => clearInterval(interval);
+  }, [isMonitoring]);
+
+  const runAutoScan = async (dirHandle: any) => {
+    // Only auto-scan if not already busy
+    if (isScanning) return;
+
+    const result: any = await analyzeDirectory(dirHandle);
+    
+    // If we found a valid card and it's DIFFERENT from the last one we scanned
+    if (!result.error && result.signature !== lastScanRef.current) {
+      lastScanRef.current = result.signature;
+      processScanResult(result);
+    } 
+    // If card was removed
+    else if (result.error && lastScanRef.current !== "") {
+      lastScanRef.current = "";
+      setStatus({ text: "Card Removed. Waiting for next...", type: "idle" });
+    }
+  };
+
   const analyzeDirectory = async (dirHandle: any) => {
     let videoFolder = null;
+    let foundName = "";
 
     async function findVideoFolder(handle: any): Promise<any> {
       for await (const entry of handle.values()) {
@@ -51,10 +88,12 @@ export default function Home() {
           if (entry.name.toLowerCase() === "dvr") {
             for await (const subEntry of entry.values()) {
               if (subEntry.kind === "directory" && subEntry.name.toLowerCase() === "video") {
+                foundName = handle.name;
                 return subEntry;
               }
             }
           }
+          // Also check inside subdirectories (up to 2 levels deep)
           const found = await findVideoFolder(entry);
           if (found) return found;
         }
@@ -62,72 +101,103 @@ export default function Home() {
       return null;
     }
 
-    videoFolder = await findVideoFolder(dirHandle);
-    if (!videoFolder) return { error: "No DVR/VIDEO folder found." };
+    try {
+      videoFolder = await findVideoFolder(dirHandle);
+      if (!videoFolder) return { error: "No DVR/VIDEO folder found." };
 
-    let goodCount = 0;
-    let badCount = 0;
+      let goodCount = 0;
+      let badCount = 0;
+      let fileSignature = "";
 
-    for await (const entry of videoFolder.values()) {
-      if (entry.kind === "file" && entry.name.toLowerCase().endsWith(".mp4")) {
-        const file = await entry.getFile();
-        if (file.size >= THRESHOLD_BYTES) {
-          goodCount++;
-        } else {
-          badCount++;
+      for await (const entry of videoFolder.values()) {
+        if (entry.kind === "file" && entry.name.toLowerCase().endsWith(".mp4")) {
+          const file = await entry.getFile();
+          fileSignature += `${file.name}-${file.size}`;
+          if (file.size >= THRESHOLD_BYTES) {
+            goodCount++;
+          } else {
+            badCount++;
+          }
         }
       }
+
+      if (goodCount + badCount === 0) return { error: "No .mp4 files found." };
+
+      return {
+        good: goodCount * DURATION_PER_FILE_HOURS,
+        bad: badCount * DURATION_PER_FILE_HOURS,
+        total: (goodCount + badCount) * DURATION_PER_FILE_HOURS,
+        clips: goodCount + badCount,
+        signature: fileSignature, // Unique ID for this specific set of files
+        name: foundName
+      };
+    } catch (e) {
+      return { error: "Access lost. Re-select folder." };
     }
-
-    if (goodCount + badCount === 0) return { error: "No .mp4 files found." };
-
-    return {
-      good: goodCount * DURATION_PER_FILE_HOURS,
-      bad: badCount * DURATION_PER_FILE_HOURS,
-      total: (goodCount + badCount) * DURATION_PER_FILE_HOURS,
-      clips: goodCount + badCount,
-    };
   };
 
-  const handleScan = async () => {
+  const processScanResult = (result: any) => {
+    const newId = cardCounter + 1;
+    setCardCounter(newId);
+    setCurrentStats({ good: result.good, bad: result.bad, total: result.total });
+
+    const efficiency = ((result.good / result.total) * 100).toFixed(1);
+    const newRow: SessionRow = {
+      id: newId,
+      name: result.name || `Card ${newId}`,
+      good: result.good,
+      bad: result.bad,
+      total: result.total,
+      eff: efficiency,
+    };
+
+    setSessionData((prev) => [...prev, newRow]);
+    setStatus({ text: `Auto-Scan Complete: ${result.name}`, type: "success" });
+  };
+
+  const handleManualScan = async () => {
     try {
       if (!(window as any).showDirectoryPicker) {
-        alert("Your browser is too old. Please use Brave, Chrome, or Edge for this tool.");
+        alert("Your browser is too old. Please use Brave, Chrome, or Edge.");
         return;
       }
 
-      const dirHandle = await (window as any).showDirectoryPicker();
+      const h = await (window as any).showDirectoryPicker();
       setIsScanning(true);
       setStatus({ text: "Scanning Card...", type: "scanning" });
 
-      const result: any = await analyzeDirectory(dirHandle);
-
+      const result: any = await analyzeDirectory(h);
       if (result.error) {
         setStatus({ text: result.error, type: "error" });
       } else {
-        const newId = cardCounter + 1;
-        setCardCounter(newId);
-        setCurrentStats({ good: result.good, bad: result.bad, total: result.total });
-
-        const efficiency = ((result.good / result.total) * 100).toFixed(1);
-        const newRow: SessionRow = {
-          id: newId,
-          good: result.good,
-          bad: result.bad,
-          total: result.total,
-          eff: efficiency,
-        };
-
-        setSessionData((prev) => [...prev, newRow]);
-        setStatus({ text: "Scan Complete", type: "success" });
+        processScanResult(result);
       }
     } catch (err: any) {
-      console.error(err);
-      if (err.name !== "AbortError") {
-        setStatus({ text: "Access Denied", type: "error" });
-      }
+      if (err.name !== "AbortError") setStatus({ text: "Scan Blocked", type: "error" });
     } finally {
       setIsScanning(false);
+    }
+  };
+
+  const toggleMonitor = async () => {
+    if (isMonitoring) {
+      setIsMonitoring(false);
+      isMonitoringRef.current = false;
+      setStatus({ text: "Monitor Mode Off", type: "idle" });
+      return;
+    }
+
+    try {
+      // ON MAC: People should select their /Volumes folder
+      // ON WINDOWS: People should select their "Computer" or Drive root
+      alert("Senior Pro Tip: Select your '/Volumes' (Mac) or 'Drives' (Win) folder to enable automatic SD card detection.");
+      const h = await (window as any).showDirectoryPicker();
+      monitorHandleRef.current = h;
+      setIsMonitoring(true);
+      isMonitoringRef.current = true;
+      setStatus({ text: "LIVE MONITORING ACTIVE (Waiting for SD Card...)", type: "scanning" });
+    } catch (err: any) {
+      if (err.name !== "AbortError") alert("Permission failed. Manual scan only.");
     }
   };
 
@@ -136,15 +206,16 @@ export default function Home() {
     setCardCounter(0);
     setStatus({ text: "Ready to Start", type: "idle" });
     setCurrentStats({ good: 0, bad: 0, total: 0 });
+    lastScanRef.current = "";
   };
 
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#000000] p-10 flex flex-col items-center font-['Outfit'] antialiased">
-      <div className="w-full max-w-4xl animate-in fade-in slide-in-from-bottom-2 duration-700">
+      <div className="w-full max-w-4xl">
         <header className="text-center mb-10">
-          <h1 className="text-4xl font-bold tracking-tighter uppercase mb-3">Build.AI</h1>
+          <h1 className="text-4xl font-bold tracking-tighter uppercase mb-3">Build.AI <span className="text-xs font-normal border border-black px-2 py-0.5 rounded ml-2">v2.0 Real-Time</span></h1>
           <div
-            className={`inline-block px-4 py-1.5 rounded-full font-semibold text-sm transition-all duration-300 ${
+            className={`inline-block px-4 py-1.5 rounded-full font-bold text-xs transition-all duration-300 ${
               status.type === "idle" ? "bg-[#E9ECEF] text-[#6C757D]" :
               status.type === "scanning" ? "bg-black text-white animate-pulse" :
               status.type === "success" ? "bg-[#D4EDDA] text-[#155724]" :
@@ -163,24 +234,30 @@ export default function Home() {
         </div>
 
         {/* Action Area */}
-        <div className="flex flex-col items-center gap-4 mb-10">
-          <button
-            onClick={handleScan}
-            disabled={isScanning}
-            className="flex items-center gap-2 bg-black text-white px-8 py-4 rounded-xl text-lg font-semibold shadow-lg hover:shadow-xl hover:scale-[1.02] active:scale-[0.98] transition-all disabled:opacity-70"
-          >
-            <svg width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M12 4v16m8-8H4"></path>
-            </svg>
-            Scan SD Card
-          </button>
+        <div className="flex flex-col items-center gap-6 mb-10">
+          <div className="flex gap-4">
+            <button
+              onClick={handleManualScan}
+              disabled={isScanning || isMonitoring}
+              className="px-8 py-4 bg-white border border-black font-bold uppercase text-sm tracking-widest hover:bg-black hover:text-white transition-all disabled:opacity-30"
+            >
+              Manual Scan
+            </button>
+            <button
+              onClick={toggleMonitor}
+              className={`px-8 py-4 font-bold border-2 uppercase text-sm tracking-widest transition-all ${
+                isMonitoring 
+                ? "bg-red-500 border-red-500 text-white hover:bg-red-700" 
+                : "bg-black border-black text-white hover:bg-[#333]"
+              }`}
+            >
+              {isMonitoring ? "⏹ Stop Monitoring" : "⚡️ Enable Auto-Discovery"}
+            </button>
+          </div>
           
           {sessionData.length > 0 && (
-            <button
-              onClick={handleReset}
-              className="px-5 py-2 text-sm font-semibold text-[#555] hover:text-black transition-colors"
-            >
-              End Calculation & Clear
+            <button onClick={handleReset} className="text-[10px] font-bold text-gray-400 hover:text-black uppercase tracking-widest">
+              Clear All Data
             </button>
           )}
         </div>
@@ -191,31 +268,34 @@ export default function Home() {
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-[#F8F9FA]">
-                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-bottom border-[#E9ECEF]">Card #</th>
-                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-bottom border-[#E9ECEF]">Good (h)</th>
-                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-bottom border-[#E9ECEF]">Bad (h)</th>
-                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-bottom border-[#E9ECEF]">Total (h)</th>
-                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-bottom border-[#E9ECEF]">Efficiency</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">ID</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">Source Name</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">Good (h)</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">Bad (h)</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">Total (h)</th>
+                  <th className="p-4 text-xs font-bold text-[#6C757D] uppercase border-b border-[#E9ECEF]">Eff</th>
                 </tr>
               </thead>
               <tbody>
                 {sessionData.map((row) => (
-                  <tr key={row.id} className="border-b border-[#E9ECEF] last:border-0">
-                    <td className="p-4 font-medium">{row.id}</td>
-                    <td className="p-4 text-[#28A745] font-semibold">{row.good.toFixed(2)}</td>
-                    <td className="p-4 text-[#DC3545] font-semibold">{row.bad.toFixed(2)}</td>
-                    <td className="p-4 text-[#D4A017] font-semibold">{row.total.toFixed(2)}</td>
-                    <td className="p-4">{row.eff}%</td>
+                  <tr key={row.id} className="border-b border-[#E9ECEF] last:border-0 hover:bg-gray-50 transition-colors">
+                    <td className="p-4 font-bold">#{row.id}</td>
+                    <td className="p-4 text-xs text-gray-500">{row.name}</td>
+                    <td className="p-4 text-[#28A745] font-bold">{row.good.toFixed(2)}</td>
+                    <td className="p-4 text-[#DC3545] font-bold">{row.bad.toFixed(2)}</td>
+                    <td className="p-4 text-[#D4A017] font-bold">{row.total.toFixed(2)}</td>
+                    <td className="p-4 font-mono text-xs">{row.eff}%</td>
                   </tr>
                 ))}
               </tbody>
               <tfoot>
-                <tr className="bg-[#F8F9FA] font-bold">
-                  <td className="p-4 text-xs text-[#000] uppercase">AVERAGES</td>
-                  <td className="p-4 text-black">{averages.good.toFixed(2)}</td>
-                  <td className="p-4 text-black">{averages.bad.toFixed(2)}</td>
-                  <td className="p-4 text-black">{averages.total.toFixed(2)}</td>
-                  <td className="p-4 text-black">{averages.eff}</td>
+                <tr className="bg-black text-white font-bold">
+                  <td className="p-4 text-[10px] uppercase">AVERAGES</td>
+                  <td></td>
+                  <td className="p-4">{averages.good.toFixed(2)}</td>
+                  <td className="p-4">{averages.bad.toFixed(2)}</td>
+                  <td className="p-4">{averages.total.toFixed(2)}</td>
+                  <td className="p-4 text-[#D4A017]">{averages.eff}</td>
                 </tr>
               </tfoot>
             </table>
